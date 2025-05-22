@@ -1,5 +1,6 @@
 from fastai.core import *
 from fastai.vision import *
+import numpy as np
 from matplotlib.axes import Axes
 from .filters import IFilter, MasterFilter, ColorizerFilter
 from .generators import gen_inference_deep, gen_inference_wide
@@ -15,6 +16,9 @@ from IPython.display import HTML
 from IPython.display import Image as ipythonimage
 import cv2
 import logging
+import shutil
+import re
+
 
 # adapted from https://www.pyimagesearch.com/2016/04/25/watermarking-images-with-opencv-and-python/
 def get_watermarked(pil_image: Image) -> Image:
@@ -217,71 +221,13 @@ class VideoColorizer:
         self.audio_root = workfolder / "audio"
         self.colorframes_root = workfolder / "colorframes"
         self.result_folder = workfolder / "result"
-
-    def _purge_images(self, dir):
-        for f in os.listdir(dir):
-            if re.search('.*?\.jpg', f):
-                os.remove(os.path.join(dir, f))
-
-    def _get_ffmpeg_probe(self, path:Path):
-        try:
-            probe = ffmpeg.probe(str(path))
-            return probe
-        except ffmpeg.Error as e:
-            logging.error("ffmpeg error: {0}".format(e), exc_info=True)
-            logging.error('stdout:' + e.stdout.decode('UTF-8'))
-            logging.error('stderr:' + e.stderr.decode('UTF-8'))
-            raise e
-        except Exception as e:
-            logging.error('Failed to instantiate ffmpeg.probe.  Details: {0}'.format(e), exc_info=True)   
-            raise e
-
-    def _get_fps(self, source_path: Path) -> str:
-        probe = self._get_ffmpeg_probe(source_path)
-        stream_data = next(
-            (stream for stream in probe['streams'] if stream['codec_type'] == 'video'),
-            None,
+        self.video_processor = VideoProcessor(
+            source_folder=self.source_folder,
+            bwframes_root=self.bwframes_root,
+            audio_root=self.audio_root,
+            colorframes_root=self.colorframes_root,
+            result_folder=self.result_folder,
         )
-        return stream_data['avg_frame_rate']
-
-    def _download_video_from_url(self, source_url, source_path: Path):
-        if source_path.exists():
-            source_path.unlink()
-
-        ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4',
-            'outtmpl': str(source_path),
-            'retries': 30,
-            'fragment-retries': 30
-        }
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([source_url])
-
-    def _extract_raw_frames(self, source_path: Path):
-        bwframes_folder = self.bwframes_root / (source_path.stem)
-        bwframe_path_template = str(bwframes_folder / '%5d.jpg')
-        bwframes_folder.mkdir(parents=True, exist_ok=True)
-        self._purge_images(bwframes_folder)
-
-        process = (
-            ffmpeg
-                .input(str(source_path))
-                .output(str(bwframe_path_template), format='image2', vcodec='mjpeg', **{'q:v':'0'})
-                .global_args('-hide_banner')
-                .global_args('-nostats')
-                .global_args('-loglevel', 'error')
-        )
-
-        try:
-            process.run()
-        except ffmpeg.Error as e:
-            logging.error("ffmpeg error: {0}".format(e), exc_info=True)
-            logging.error('stdout:' + e.stdout.decode('UTF-8'))
-            logging.error('stderr:' + e.stderr.decode('UTF-8'))
-            raise e
-        except Exception as e:
-            logging.error('Errror while extracting raw frames from source video.  Details: {0}'.format(e), exc_info=True)   
-            raise e
 
     def _colorize_raw_frames(
         self, source_path: Path, render_factor: int = None, post_process: bool = True,
@@ -289,7 +235,7 @@ class VideoColorizer:
     ):
         colorframes_folder = self.colorframes_root / (source_path.stem)
         colorframes_folder.mkdir(parents=True, exist_ok=True)
-        self._purge_images(colorframes_folder)
+        self.video_processor._purge_images(colorframes_folder)
         bwframes_folder = self.bwframes_root / (source_path.stem)
 
         for img in progress_bar(os.listdir(str(bwframes_folder))):
@@ -301,88 +247,20 @@ class VideoColorizer:
                 )
                 color_image.save(str(colorframes_folder / img))
 
-    def _build_video(self, source_path: Path) -> Path:
-        colorized_path = self.result_folder / (
-            source_path.name.replace('.mp4', '_no_audio.mp4')
-        )
-        colorframes_folder = self.colorframes_root / (source_path.stem)
-        colorframes_path_template = str(colorframes_folder / '%5d.jpg')
-        colorized_path.parent.mkdir(parents=True, exist_ok=True)
-        if colorized_path.exists():
-            colorized_path.unlink()
-        fps = self._get_fps(source_path)
-
-        process = (
-            ffmpeg 
-                .input(str(colorframes_path_template), format='image2', vcodec='mjpeg', framerate=fps) 
-                .output(str(colorized_path), crf=17, vcodec='libx264')
-                .global_args('-hide_banner')
-                .global_args('-nostats')
-                .global_args('-loglevel', 'error')
-        )
-
-        try:
-            process.run()
-        except ffmpeg.Error as e:
-            logging.error("ffmpeg error: {0}".format(e), exc_info=True)
-            logging.error('stdout:' + e.stdout.decode('UTF-8'))
-            logging.error('stderr:' + e.stderr.decode('UTF-8'))
-            raise e
-        except Exception as e:
-            logging.error('Errror while building output video.  Details: {0}'.format(e), exc_info=True)   
-            raise e
-
-        result_path = self.result_folder / source_path.name
-        if result_path.exists():
-            result_path.unlink()
-        # making copy of non-audio version in case adding back audio doesn't apply or fails.
-        shutil.copyfile(str(colorized_path), str(result_path))
-
-        # adding back sound here
-        audio_file = Path(str(source_path).replace('.mp4', '.aac'))
-        if audio_file.exists():
-            audio_file.unlink()
-
-        os.system(
-            'ffmpeg -y -i "'
-            + str(source_path)
-            + '" -vn -acodec copy "'
-            + str(audio_file)
-            + '"'
-            + ' -hide_banner'
-            + ' -nostats'
-            + ' -loglevel error'
-        )
-
-        if audio_file.exists():
-            os.system(
-                'ffmpeg -y -i "'
-                + str(colorized_path)
-                + '" -i "'
-                + str(audio_file)
-                + '" -shortest -c:v copy -c:a aac -b:a 256k "'
-                + str(result_path)
-                + '"'
-                + ' -hide_banner'
-                + ' -nostats'
-                + ' -loglevel error'
-            )
-        logging.info('Video created here: ' + str(result_path))
-        return result_path
-
     def colorize_from_url(
         self,
         source_url,
-        file_name: str,
+        base_file_name: str, # Changed from file_name, expected to be extensionless
         render_factor: int = None,
         post_process: bool = True,
         watermarked: bool = True,
 
     ) -> Path:
-        source_path = self.source_folder / file_name
-        self._download_video_from_url(source_url, source_path)
+        # base_file_name is expected to be without extension, e.g., "my_video"
+        base_source_path = self.video_processor.source_folder / base_file_name
+        actual_source_path = self.video_processor._download_video_from_url(source_url, base_source_path)
         return self._colorize_from_path(
-            source_path, render_factor=render_factor, post_process=post_process,watermarked=watermarked
+            actual_source_path, render_factor=render_factor, post_process=post_process,watermarked=watermarked
         )
 
     def colorize_from_file_name(
@@ -400,11 +278,318 @@ class VideoColorizer:
             raise Exception(
                 'Video at path specfied, ' + str(source_path) + ' could not be found.'
             )
-        self._extract_raw_frames(source_path)
+        self.video_processor._extract_raw_frames(source_path)
         self._colorize_raw_frames(
             source_path, render_factor=render_factor,post_process=post_process,watermarked=watermarked
         )
-        return self._build_video(source_path)
+        self._apply_temporal_smoothing(source_path)
+        return self.video_processor._build_video(source_path)
+
+    def _apply_temporal_smoothing(self, source_path: Path, alpha: float = 0.7):
+        colorframes_folder = self.colorframes_root / (source_path.stem)
+        if not colorframes_folder.exists():
+            logging.warning(f"Colorized frames folder not found: {colorframes_folder}. Skipping temporal smoothing.")
+            return
+
+        frame_files = sorted([f for f in os.listdir(str(colorframes_folder)) if re.search(r'.*?\.jpg$', f)])
+
+        if len(frame_files) < 3:
+            logging.info("Not enough frames for temporal smoothing. Skipping.")
+            return
+
+        logging.info(f"Applying temporal smoothing to {len(frame_files)} frames for {source_path.name}...")
+
+        img_prev = None
+        img_curr = None
+        img_next = None
+        img_smoothed_curr = None # Stores the result of smoothing img_curr
+        blended_neighbors = None 
+
+        try:
+            # Initialize by loading the first two images
+            img_prev_path = colorframes_folder / frame_files[0]
+            img_prev = self.vis._open_pil_image(img_prev_path)
+            
+            img_curr_path = colorframes_folder / frame_files[1]
+            img_curr = self.vis._open_pil_image(img_curr_path)
+        except Exception as e:
+            logging.error(f"Could not open initial frames for temporal smoothing in {colorframes_folder}. Error: {e}", exc_info=True)
+            if img_prev and hasattr(img_prev, 'close'): img_prev.close()
+            if img_curr and hasattr(img_curr, 'close'): img_curr.close()
+            return
+
+        logging.info(f"Starting temporal smoothing loop for frames in {colorframes_folder}...")
+        # Loop from the second frame (index 1) up to the second-to-last frame (index len(frame_files) - 2)
+        # The frame being modified and saved is img_files[i], which corresponds to the initial img_curr
+        for i in range(1, len(frame_files) - 1):
+            img_next_path = None # For logging in except block
+            try:
+                img_next_path = colorframes_folder / frame_files[i+1]
+                if img_next: img_next.close() # Close previous img_next
+                img_next = self.vis._open_pil_image(img_next_path)
+
+                # 1. Blend neighbors: blended_neighbors = 0.5*img_prev + 0.5*img_next
+                if blended_neighbors: blended_neighbors.close()
+                blended_neighbors = Image.blend(img_prev, img_next, 0.5)
+                
+                # 2. Blend current with blended_neighbors: result = alpha*img_curr + (1-alpha)*blended_neighbors
+                # Image.blend(B, A, alpha_curr_weight) means (1-alpha_curr_weight)*B + alpha_curr_weight*A
+                # Here A is img_curr, B is blended_neighbors. alpha is weight of img_curr.
+                if img_smoothed_curr: img_smoothed_curr.close()
+                img_smoothed_curr = Image.blend(blended_neighbors, img_curr, alpha)
+
+                output_frame_path = colorframes_folder / frame_files[i] # This is path for original img_curr
+                logging.debug(f"Saving temporally smoothed frame: {output_frame_path.name}")
+                img_smoothed_curr.save(output_frame_path)
+
+                # Shift frames for the next iteration: current becomes previous, next becomes current
+                if img_prev: img_prev.close() 
+                img_prev = img_curr
+                img_curr = img_next
+                img_next = None # Will be loaded at the start of the next iteration
+
+            except Exception as e:
+                logging.error(f"Error during temporal smoothing for frame {frame_files[i]} (path: {colorframes_folder/frame_files[i]}). Next frame was {img_next_path}. Details: {e}", exc_info=True)
+                # Attempt to close images if they are open
+                if img_next is not None and hasattr(img_next, 'close'): img_next.close()
+                # Let the outer finally block handle img_prev, img_curr, img_smoothed_curr, blended_neighbors
+                break # Exit loop on error
+            finally:
+                # Close intermediate images created in this iteration
+                if img_smoothed_curr and hasattr(img_smoothed_curr, 'close'):
+                    try:
+                        if hasattr(img_smoothed_curr, 'fp') and img_smoothed_curr.fp and not img_smoothed_curr.fp.closed:
+                            img_smoothed_curr.close()
+                    except Exception: pass
+                    img_smoothed_curr = None 
+                if blended_neighbors and hasattr(blended_neighbors, 'close'):
+                    try:
+                        if hasattr(blended_neighbors, 'fp') and blended_neighbors.fp and not blended_neighbors.fp.closed:
+                             blended_neighbors.close()
+                    except Exception: pass
+                    blended_neighbors = None
+
+        # Close the last two images held in img_prev and img_curr after the loop finishes
+        if img_prev and hasattr(img_prev, 'close'):
+            try:
+                if hasattr(img_prev, 'fp') and img_prev.fp and not img_prev.fp.closed: img_prev.close()
+            except Exception: pass
+        if img_curr and hasattr(img_curr, 'close'):
+            try:
+                if hasattr(img_curr, 'fp') and img_curr.fp and not img_curr.fp.closed: img_curr.close()
+            except Exception: pass
+        # img_next should be None here if loop completed, or closed in case of error.
+        # img_smoothed_curr and blended_neighbors are closed in the loop's finally or here if loop didn't run.
+        if img_smoothed_curr and hasattr(img_smoothed_curr, 'close'):
+            try:
+                if hasattr(img_smoothed_curr, 'fp') and img_smoothed_curr.fp and not img_smoothed_curr.fp.closed: img_smoothed_curr.close()
+            except Exception: pass
+        if blended_neighbors and hasattr(blended_neighbors, 'close'):
+            try:
+                if hasattr(blended_neighbors, 'fp') and blended_neighbors.fp and not blended_neighbors.fp.closed: blended_neighbors.close()
+            except Exception: pass
+
+
+        logging.info(f"Temporal smoothing completed for frames in {colorframes_folder}.")
+
+
+class VideoProcessor:
+    def __init__(self, source_folder: Path, bwframes_root: Path, audio_root: Path, colorframes_root: Path, result_folder: Path):
+        self.source_folder = source_folder
+        self.bwframes_root = bwframes_root
+        self.audio_root = audio_root
+        self.colorframes_root = colorframes_root
+        self.result_folder = result_folder
+
+    def _get_ffmpeg_probe(self, path:Path):
+        try:
+            probe = ffmpeg.probe(str(path))
+            return probe
+        except ffmpeg.Error as e:
+            # Attempt to reconstruct the conceptual "command" for logging
+            # For ffmpeg.probe, the arguments are part of the function call.
+            # We can log the path being probed.
+            cmd_str = f"ffmpeg.probe(filename='{str(path)}')"
+            error_message = (
+                f"ffmpeg failed during video probing for {path.name}.\n"
+                f"Attempted operation: {cmd_str}\n"
+                f"FFmpeg stdout: {e.stdout.decode('utf-8') if e.stdout else 'N/A'}\n"
+                f"FFmpeg stderr: {e.stderr.decode('utf-8') if e.stderr else 'N/A'}"
+            )
+            logging.error(error_message, exc_info=True)
+            raise e
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during ffmpeg.probe for {path.name}.", exc_info=True)
+            raise e
+
+    def _purge_images(self, dir):
+        for f in os.listdir(dir):
+            if re.search('.*?\.jpg', f):
+                os.remove(os.path.join(dir, f))
+
+    def _get_fps(self, source_path: Path) -> str:
+        probe = self._get_ffmpeg_probe(source_path)
+        stream_data = next(
+            (stream for stream in probe['streams'] if stream['codec_type'] == 'video'),
+            None,
+        )
+        return stream_data['avg_frame_rate']
+
+    def _download_video_from_url(self, source_url: str, base_source_path: Path) -> Path:
+        # base_source_path is expected to be like /video/source/my_video_title (no extension)
+        # Clean up any existing files that might match the base name + any extension
+        existing_files = list(base_source_path.parent.glob(f"{base_source_path.name}.*"))
+        for f_exist in existing_files:
+            logging.info(f"Removing existing file {f_exist} before download.")
+            f_exist.unlink()
+
+        ydl_opts = {
+            'format': 'bestvideo+bestaudio/best', # Download best available format
+            'outtmpl': str(base_source_path) + '.%(ext)s', # yt-dlp will add the correct extension
+            'retries': 30,
+            'fragment-retries': 30,
+            'quiet': True, # Suppress yt-dlp console output unless errors
+            'merge_output_format': 'mp4' # if merging is needed, prefer mp4, but format selection above is primary
+        }
+        try:
+            with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([source_url])
+        except yt_dlp.utils.DownloadError as e:
+            logging.error(f"Failed to download video from URL: {source_url}. yt_dlp DownloadError: {e}", exc_info=True)
+            raise e
+        except Exception as e:
+            logging.error(f"An unexpected error occurred while trying to download video from URL: {source_url}. Error: {e}", exc_info=True)
+            raise e
+        
+        # Find the actual downloaded file
+        # yt-dlp should have added an extension based on '.%(ext)s'
+        downloaded_files = sorted(base_source_path.parent.glob(f"{base_source_path.name}.*"), key=os.path.getmtime, reverse=True)
+        
+        if not downloaded_files:
+            raise Exception(f"Failed to find downloaded file for base {base_source_path.name} in {base_source_path.parent}")
+        
+        actual_source_path = downloaded_files[0]
+        logging.info(f"Video downloaded to: {actual_source_path}")
+        return actual_source_path
+
+    def _extract_raw_frames(self, source_path: Path):
+        bwframes_folder = self.bwframes_root / (source_path.stem)
+        bwframe_path_template = str(bwframes_folder / '%5d.jpg')
+        bwframes_folder.mkdir(parents=True, exist_ok=True)
+        self._purge_images(bwframes_folder)
+
+        process = (
+            ffmpeg
+                .input(str(source_path))
+                .output(str(bwframe_path_template), format='image2', vcodec='mjpeg', **{'q:v':'0'})
+                .global_args('-hide_banner')
+                .global_args('-nostats')
+                .global_args('-loglevel', 'error')
+        )
+
+        try:
+            # The process.run() method in ffmpeg-python returns (stdout, stderr)
+            # and raises ffmpeg.Error on non-zero return code.
+            # Ensure capture_stdout and capture_stderr are True if you need to access them outside the exception.
+            # However, e.stdout and e.stderr are populated in the exception object.
+            process.run(capture_stdout=True, capture_stderr=True) 
+        except ffmpeg.Error as e:
+            error_message = (
+                f"ffmpeg failed during raw frame extraction for {source_path.name}.\n"
+                f"Command: {' '.join(process.args)}\n"
+                f"FFmpeg stdout: {e.stdout.decode('utf-8') if e.stdout else 'N/A'}\n"
+                f"FFmpeg stderr: {e.stderr.decode('utf-8') if e.stderr else 'N/A'}"
+            )
+            logging.error(error_message, exc_info=True)
+            raise e
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during raw frame extraction for {source_path.name}.", exc_info=True)
+            raise e
+
+    def _build_video(self, source_path: Path) -> Path:
+        # Output paths should consistently use .mp4 extension
+        colorized_path = self.result_folder / (source_path.stem + '_no_audio.mp4')
+        result_path = self.result_folder / (source_path.stem + '.mp4')
+
+        colorframes_folder = self.colorframes_root / (source_path.stem)
+        colorframes_path_template = str(colorframes_folder / '%5d.jpg')
+        
+        colorized_path.parent.mkdir(parents=True, exist_ok=True)
+        if colorized_path.exists():
+            colorized_path.unlink()
+        
+        fps = self._get_fps(source_path)
+
+        process = (
+            ffmpeg
+                .input(str(colorframes_path_template), format='image2', vcodec='mjpeg', framerate=fps)
+                .output(str(colorized_path), crf=17, vcodec='libx264') # Ensures MP4 output for colorized part
+                .global_args('-hide_banner')
+                .global_args('-nostats')
+                .global_args('-loglevel', 'error')
+        )
+
+        try:
+            process.run(capture_stdout=True, capture_stderr=True)
+        except ffmpeg.Error as e:
+            error_message = (
+                f"ffmpeg failed during video building (pass 1 - creating video from colorized frames) for {source_path.name}.\n"
+                f"Command: {' '.join(process.args)}\n"
+                f"FFmpeg stdout: {e.stdout.decode('utf-8') if e.stdout else 'N/A'}\n"
+                f"FFmpeg stderr: {e.stderr.decode('utf-8') if e.stderr else 'N/A'}"
+            )
+            logging.error(error_message, exc_info=True)
+            raise e
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during video building (pass 1) for {source_path.name}.", exc_info=True)
+            raise e
+
+        if result_path.exists():
+            result_path.unlink()
+        # making copy of non-audio version in case adding back audio doesn't apply or fails.
+        shutil.copyfile(str(colorized_path), str(result_path))
+
+        # adding back sound here
+        # Audio file should be uniquely named based on source stem and stored in audio_root
+        self.audio_root.mkdir(parents=True, exist_ok=True) # Ensure audio_root exists
+        audio_file = self.audio_root / (source_path.stem + '.aac')
+        
+        if audio_file.exists():
+            audio_file.unlink()
+
+        # Audio extraction from the original source_path (could be .mkv, .webm, etc.)
+        audio_extract_cmd = [
+            'ffmpeg', '-y', '-i', str(source_path),
+            '-vn', '-acodec', 'copy', str(audio_file),
+            '-hide_banner', '-nostats', '-loglevel', 'error'
+        ]
+        try:
+            # Using subprocess for better error handling potential, though os.system is kept for now.
+            # For os.system, we can't easily get stderr/stdout or specific exceptions.
+            # A non-zero return code indicates failure but not details.
+            ret_code = os.system(' '.join(audio_extract_cmd))
+            if ret_code != 0:
+                logging.error(f"Audio extraction command failed with exit code {ret_code} for {source_path.name}. Command: {' '.join(audio_extract_cmd)}", exc_info=False) # exc_info=False as there's no exception object here
+                # Not raising an error here to match previous behavior of os.system, but logging it.
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during audio extraction for {source_path.name}. Command: {' '.join(audio_extract_cmd)}", exc_info=True)
+            # Not raising error to keep flow similar to plain os.system if it were to somehow raise
+
+        if audio_file.exists():
+            audio_merge_cmd = [
+                'ffmpeg', '-y', '-i', str(colorized_path), '-i', str(audio_file),
+                '-shortest', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k', str(result_path),
+                '-hide_banner', '-nostats', '-loglevel', 'error'
+            ]
+            try:
+                ret_code = os.system(' '.join(audio_merge_cmd))
+                if ret_code != 0:
+                    logging.error(f"Audio merge command failed with exit code {ret_code} for {source_path.name}. Command: {' '.join(audio_merge_cmd)}", exc_info=False)
+            except Exception as e:
+                logging.error(f"An unexpected error occurred during audio merging for {source_path.name}. Command: {' '.join(audio_merge_cmd)}", exc_info=True)
+
+        logging.info('Video created here: ' + str(result_path))
+        return result_path
 
 
 def get_video_colorizer(render_factor: int = 21) -> VideoColorizer:

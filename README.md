@@ -23,6 +23,12 @@ exclusively.  Try a few images for free! [MyHeritage In Color](https://www.myher
 Image (artistic) [![Colab for images](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jantic/DeOldify/blob/master/ImageColorizerColab.ipynb)
 | Video [![Colab for video](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jantic/DeOldify/blob/master/VideoColorizerColab.ipynb)
 
+### Advanced Video Colorization (Reduced Flickering)
+
+This project now includes an advanced video colorization pipeline designed to improve temporal consistency and reduce the flickering often seen when colorizing videos frame by frame. This approach uses a model that considers multiple frames simultaneously (conceptually similar to architectures like BiSTNet) to make more informed colorization decisions.
+
+For details and usage, please see the [AdvancedVideoColorizer.ipynb](AdvancedVideoColorizer.ipynb) notebook. This is recommended for users seeking higher quality video colorization results, especially for videos with motion. The original `VideoColorizer.ipynb` is still available for comparison or for users who prefer the single-frame processing model.
+
 Having trouble with the default image colorizer, aka "artistic"?  Try the
 "stable" one below.  It generally won't produce colors that are as interesting as
 "artistic", but the glitches are noticeably reduced.
